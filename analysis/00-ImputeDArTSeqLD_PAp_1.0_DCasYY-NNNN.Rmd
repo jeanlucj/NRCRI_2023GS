@@ -1,0 +1,336 @@
+---
+title: "Impute NRCRI DArTSeqLD DCas23-8175"
+site: workflowr::wflow_site
+date: "2023-July-17"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+## The big idea.  
+Should be able to start from on the work server and run this rmarkdown using  
+module load R/4.2.1-r9  
+Rscript -e 'devtools::install_github("wolfemd/genomicMateSelectR", ref = "master")'  
+Rscript -e 'Sys.setenv(RSTUDIO_PANDOC="/usr/lib/rstudio-server/bin/quarto/bin/tools"); rmarkdown::render("00-ImputeDArTSeqLD_PAp_1.0_DCasYY-NNNN.Rmd")'  
+The rmarkdown will copy the relevant data from home/jj332 on to the work server
+so you need to have the data properly set up on jj332.  
+The only reason not to do this from RStudio is because `plan(multicore)` is
+considered unstable from RStudio. Thus, do it from the command line.  
+NOTE: I'm only putting the devtools install on 00-Impute...  
+NOTE: This Rmd does the conversion of the DArT report to proper VCF too
+
+### Process.  
+Work from the biohpc home directory in RStudio.  It'll just be simpler...  
+Start with your scripts in a `workflow`-like directory structure with 
+`analysis`, `code`, `data`, and `output` subfolders in 
+`/home/jj332/jobName`
+NOTE: After this all runs, copy the folder structure to jj332_cas for safekeeping
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+reportName <- "DCas22-7085" # Use this if you need to compare with last year
+reportName <- "DCas23-8175"
+reportNumber <- strsplit(reportName,"-")[[1]][2]
+netID <- "jj332"
+jobName <- "NRCRI_2023GS"
+library(tidyverse)
+```
+
+### Server to use.  
+Use 1 large memory Cornell CBSU machine (e.g. [112 cores, 512 GB RAM](https://biohpc.cornell.edu/lab/hardware.aspx)), running 1 chromosome at a time.
+
+### What code where.  
+R functions are stored in the `code` sub-directory. Functions sourced from e.g. `imputationFunctions.R` are wrappers around e.g. Beagle, and other command line programs.
+
+### Copy data.  
+Copy the imputation reference panel from 2019 to the `data` folder.  
+Start with your scripts in a `workflow`-like directory structure with 
+`analysis`, `code`, `data`, and `output` subfolders in 
+`/home/netID/jobName`
+```{r copy files over}
+copyToDir <- paste0("/workdir/", netID, "/")
+copyToJob <- paste0(copyToDir, jobName, "/data/")
+homeJob <- paste0("/home/", netID, "/", jobName, "/")
+homeJobOut <- paste0(homeJob, "output/")
+
+dir.create(copyToDir)
+# Important to have overwrite=T in case you have to rerun the analysis with new files
+file.copy(from=homeJob, to=copyToDir, recursive=T, overwrite=T)
+file.copy(from="/home/jj332_cas/CassavaGenotypeData/CassavaGeneticMap",
+          to=copyToJob, recursive=T, overwrite=T)
+
+# glob2rx makes a regular expression out of a string
+flist <- list.files(path="/home/jj332_cas/CassavaGenotypeData/nextgenImputation2019/ImputationStageII_71219/",
+           pattern=glob2rx("chr*_ImputationReferencePanel_StageIIpartI_72219.vcf.gz"),
+           full.names=T)
+file.copy(from=flist, to=copyToJob, overwrite=T)
+```
+
+### Set base path
+```{r set base path}
+setwd(paste0(copyToDir, jobName, "/analysis/"))
+here::i_am("analysis/00-ImputeDArTSeqLD_PAp_1.0_DCasYY-NNNN.Rmd")
+source(here::here("code","imputationFunctions.R"))
+source(here::here("code","convertDart2vcf.R"))
+
+```
+DArTseqLD
+Impute DCas23-8175.  
+Marnin imputed DCas21-5841.
+For cross validation Marnin uses SNP panels on the ftp server:
+(I'm not finding this one on jj332_cas)
+DosageMatrix_RefPanelAndGSprogeny_ReadyForGP_73019.rds
+It's here:
+https://cassavabase.org/ftp/marnin_datasets/NGC_BigData/
+
+snps5510 DosageMatrix_DCas20_5510_WA_REFimputedAndFiltered.rds
+snps5440 DosageMatrix_DCas20_5440_WA_REFimputedAndFiltered.rds
+marnin > NRCRI_2020GS > output
+DosageMatrix_DCas20_5440_WA_REFimputedAndFiltered.rds
+DosageMatrix_DCas20_5510_WA_REFimputedAndFiltered.rds
+Also: 
+DosageMatrix_NRCRI_2020Oct15.rds
+DosageMatrix_NRCRI_SamplesForGP_2020April27.rds
+and this one in output:
+snps5841 DosageMatrix_DCas21_5841_WA_REFimputedAndFiltered.rds
+marnin > NRCRI_2021GS > output
+DosageMatrix_DCas21_5841_WA_REFimputedAndFiltered.rds
+Also (but I don't know what that is...): 
+DosageMatrix_NRCRI_2021May03.rds
+
+I will have to see what Luciano imputed and if the output of that still exists.
+From 2022:
+DCas22-7051
+DCas22-7085
+DCas22-7086
+I will have to go through systematically but I have 
+[Luciano's github](https://github.com/LucianoRogerio/NRCRI_2022GS/)
+There are imputation files for 7051 and 7086.  I will have to look if they were
+folded into the 7085 Dosage matrix or if they were just not used.
+
+For cross validation Luciano uses DosageMatrix_DCas22_7085RefPopImputed.rds
+lbraatz > NRCRI_2022GS > output
+DosageMatrix_DCas22_7085_WA_REFimputedAndFiltered.rds
+
+## Convert DArT report to VCF
+Parameters are:
+`dartvcfInput` input name and path of "vcf" file from DArT
+`dartcountsInput` input name and path of counts file from DArT
+`outName` output path and name
+`nskipvcf` number of "VCF" rows to skip on read-in
+`nskipcounts` number of "counts file" rows to skip on read in
+`ncores` number of cores to use, could be VERY memory intensive
+`dartVars` chr vector, column names that _are not_ sample IDs in the read-counts
+file. I use this internally to assign the sampleIDs in the VCF file
+```{r DArT to VCF parameters}
+dartvcfInput <- here::here("data",
+                  paste0("Report-", reportName),
+                  paste0("Report_", reportNumber, "_VCF_Ref_Version6.txt"))
+dartcountsInput <- here::here("data",
+                  paste0("Report-", reportName),
+                  "SEQ_SNPs_counts_0_Target_extend_Ref.csv")
+outName <- here::here("data",
+                      paste0("Report-", reportName), reportName)
+nskipvcf <- 2 
+nskipcounts <- 2
+ncores <- 10
+```
+
+### Check DArT to VCF conversion manually
+
+Check that the files read in according to previous code. Adjust code if
+necessary. Make a function and apply it to the input files.
+
+```{r Manual check of VCF, eval=FALSE}
+vcf <- read.table(dartvcfInput,
+                stringsAsFactors = F,
+                skip = nskipvcf, header = T, sep = "\t", comment.char = "")
+readCounts <- read.csv(dartcountsInput, 
+                       stringsAsFactors = F, header = T, skip=nskipcounts)
+
+dim(vcf)
+# [[1] 13603   1841
+dim(readCounts)
+# [1] 27206   1875
+# # Initial look at names....
+colnames(readCounts)[1:50]
+# [1] "AlleleID"                                 "CloneID"                                 
+# [3] "ClusterTempIndex"                         "AlleleSequence"                          
+# [5] "TrimmedSequence"                          "TrimmedSequence_plus_Strand"             
+# [7] "Short"                                    "Lowcomplexity"                           
+# [9] "Chrom_Cassava_v61"                        "ChromPos_Cassava_v61"                    
+#[11] "SNP_ChromPos_Cassava_v61"                 "AlnCnt_Cassava_v61"                      
+#[13] "AlnEvalue_Cassava_v61"                    "Strand_Cassava_v61"                      
+#[15] "SeqDiff_Cassava_v61"                      "ClusterConsensusSequence"                
+#[17] "ClusterSize"                              "AlleleSeqDist"                           
+#[19] "SNP"                                      "SnpPosition"                             
+#[21] "CallRate"                                 "OneRatioRef"                             
+#[23] "OneRatioSnp"                              "FreqHomRef"                              
+#[25] "FreqHomSnp"                               "FreqHets"                                
+#[27] "PICRef"                                   "PICSnp"                                  
+#[29] "AvgPIC"                                   "AvgCountRef"                             
+#[31] "AvgCountSnp"                              "RatioAvgCountRefAvgCountSnp"             
+#[33] "FreqHetsMinusFreqMinHom"                  "AlleleCountsCorrelation"                 
+#[35] "aggregateTagsTotal"                       "DerivedCorrMinusSeedCorr"                
+#[37] "RepRef"                                   "RepSNP"                                  
+#[39] "RepAvg"                                   "PicRepRef"                               
+#[41] "PicRepSNP"                                "TotalPicRepRefTest"                      
+#[43] "TotalPicRepSnpTest"                       "NR22.NG.C4.Cass.0001_A02...NR22C4F2P0007"
+#[45] "NR22.NG.C4.Cass.0001_B02...NR22C4F2P0008" "NR22.NG.C4.Cass.0001_C02...NR22C4F2P0009"
+#[47] "NR22.NG.C4.Cass.0001_D02...NR22C4F2P0010" "NR22.NG.C4.Cass.0001_E02...NR22C4F3P0001"
+#[49] "NR22.NG.C4.Cass.0001_F02...NR22C4F3P0002" "NR22.NG.C4.Cass.0001_G02...NR22C4F4P0002"
+
+colnames(vcf)[1:20]
+# [3] "ID"                                       
+# [4] "REF"                                      
+# [5] "ALT"                                      
+# [6] "QUAL"                                     
+# [7] "FILTER"                                   
+# [8] "INFO"                                     
+# [9] "FORMAT"                                   
+#[10] "NR22.NG.C4.Cass.0001_A01...NR22C4F1P0002" 
+#[11] "NR22.NG.C4.Cass.0001_A10...NR22C4F13P0001"
+#[12] "NR22.NG.C4.Cass.0001_A11...NR22C4F14P0001"
+#[13] "NR22.NG.C4.Cass.0001_A12...NR22C4F18P0003"
+#[14] "NR22.NG.C4.Cass.0001_A02...NR22C4F2P0007" 
+#[15] "NR22.NG.C4.Cass.0001_A03...NR22C4F4P0004" 
+#[16] "NR22.NG.C4.Cass.0001_A04...NR22C4F8P0003" 
+#[17] "NR22.NG.C4.Cass.0001_A05...NR22C4F10P0011"
+#[18] "NR22.NG.C4.Cass.0001_A06...NR22C4F10P0026"
+#[19] "NR22.NG.C4.Cass.0001_A07...NR22C4F10P0043"
+#[20] "NR22.NG.C4.Cass.0001_A08...NR22C4F10P0055"
+# rm(vcf,readCounts); gc()
+```
+
+### Run conversion function
+Among others, this function extracts chromosome numbers from chromosome names.
+That leads to some NAs introduced by coercion warnings.
+NOTE: Forked processing ('multicore') is not supported when running R from RStudio
+I assume therefore it will go sequentially (?)
+```{r Convert DArT to VCF}
+convertDart2vcf(dartvcfInput, dartcountsInput, outName,
+                nskipvcf=nskipvcf, nskipcounts=nskipcounts, ncores=ncores)
+```
+
+### Genomewide to per-chrom VCFs
+
+Split the genome-wide VCF into per-chromosome VCFs for imputation.
+
+```{r Make per-chromosome VCFs}
+require(furrr); options(mc.cores=18); plan(multicore)
+
+vcfIn <- here::here("data", 
+                    paste0("Report-", reportName),
+                    paste0(reportName, ".vcf.gz"))
+filters <- "--minDP 4 --maxDP 50" # because using GT not PL for impute (Beagle5)
+outPath <- here::here("data",
+                      paste0("Report-", reportName, "/"))
+
+future_map(1:18,
+           ~splitVCFbyChr(Chr=.,
+                          vcfIn=vcfIn,filters=filters,
+                          outPath=outPath, outSuffix=reportName))
+
+```
+
+## Impute with West Africa RefPanel
+Impute with 
+[Beagle V5.0](https://faculty.washington.edu/browning/beagle/b5_0.html).
+
+Use the "imputation reference panel" dataset from 2019, e.g. `chr1_ImputationReferencePanel_StageIIpartI_72219.vcf.gz` as reference.
+
+Check about the slashes: do I need them?
+```{r paths to marker data}
+# location of the targetVCF
+targetVCFpath <- here::here("data", paste0("Report-", reportName, "/"))
+refVCFpath <- here::here("data/")
+mapPath <- here::here("data", "CassavaGeneticMap/")
+outPath <- here::here("output/")
+```
+
+```{r impute one chr at a time}
+purrr::map(1:18, 
+           ~runBeagle5(
+             targetVCF=paste0(targetVCFpath,"/chr",.,"_", reportName, ".vcf.gz"),
+             refVCF=paste0(refVCFpath,"/chr",.,"_ImputationReferencePanel_StageIIpartI_72219.vcf.gz"),
+             mapFile=paste0(mapPath,"/chr",.,"_cassava_cM_pred.v6_91019.map"),
+             outName=paste0(outPath,"chr",.,"_", reportName, "_WA_REFimputed"),
+             nthreads=112))
+```
+
+Clean up Beagle log files after run. Move to sub-directory `output/BeagleLogs/`.
+```{r Clean up Beagle logs}
+dir.create(here::here("output", "BeagleLogs"))
+flist <- here::here("output", 
+                    paste0("*_", reportName, "_WA_REFimputed.log")) %>%
+  glob2rx %>% list.files(full.names=T)
+file.copy(from=flist, to=here::here("output", "BeagleLogs"))
+file.copy(from=here::here("output", "BeagleLogs"), to=homeJobOut, recursive=T)
+flist <- here::here("output", 
+                    paste0("*_", reportName, "_WA_REFimputed*")) %>%
+  glob2rx %>% list.files(full.names=T)
+file.copy(from=flist, to=homeJobOut)
+```
+
+## Post-impute filter.  
+For now, the function will just do a fixed filter: AR2>0.75 (DR2>0.75 as of Beagle5.0), P_HWE>1e-20, MAF>0.005 [0.5%]. 
+
+It can easily be modified in the future to include parameters to vary the filter specifications.
+
+Input parameters
+`inPath` path to input VCF-to-be-filtered, can be left null if path included in
+`inName` . Must end in "/"
+`inName` name of input VCF file EXCLUDING file extension. Assumes .vcf.gz
+`outPath` path where filtered VCF and related are to be stored.Can be left null
+if path included in `outName` . Must end in "/".
+`outName` name desired for output EXCLUDING extension. Output will be .vcf.gz 
+```
+
+Loop to filter all 18 VCF files in parallel
+```{r filter VCFs}
+inPath <- here::here("output/")
+outPath <- here::here("output/")
+source(here::here("code","imputationFunctions.R"))
+require(furrr); options(mc.cores=18); plan(multicore)
+future_map(1:18,
+  ~postImputeFilter(inPath=inPath,
+                    inName=paste0("chr",.,"_", reportName, "_WA_REFimputed"),
+                    outPath=outPath,
+                    outName=paste0("chr",.,"_", reportName, "_WA_REFimputedAndFiltered")))
+```
+
+Check what's left
+```{r count markers after filtering}
+purrr::map(1:18,
+  ~system(paste0("zcat ", 
+                 here::here("output/"), "chr",.,
+                 "_", reportName, "_WA_REFimputedAndFiltered.vcf.gz | wc -l")))
+```
+
+```{r Copy final imputed}
+
+flist <- here::here("output", 
+                    paste0("*_", reportName, "_WA_REFimputed*")) %>%
+  glob2rx %>% list.files(full.names=T)
+file.copy(from=flist, to=homeJobOut, recursive=T)
+```
+
+# Formats for downstream analysis
+
+The function below will (1) convert the input VCF to plink1.9 binary format and (2) convert the plink binary to a dosage (0,1,2) matrix with special attention to which allele gets counted in the file.
+
+**NOTE:** I was worried about `plink1.9` changing allele codes between files. There is some risk the counted allele could switch between e.g. the reference panel and the progeny files because of allele freq. (see plink documentation). To avoid this, went to extra trouble: write a file suffixed `*.alleleToCount` listing SNP ID (column 1) and the ALT allele from the VCF (column 2). Pass the file to `plink1.9` using the `--recode-allele` flag to ensure all output dosages count the ALT allele consistent with the VCFs. The reason to use `plink1.9` is that `Beagle5` imputed files don't have a **DS** (dosage) field that can be directly extracted. Instead, phased genotypes e.g. `0|1` need to be converted to dosages (e.g. `0|1 --> 1`, `1|1 --> 2`). An alternative might be to extract the haplotypes using `vcftools` and manually (in R) computed the dosages; that would give most control but is slow.
+
+```{r Make dosage format}
+library(tidyverse)
+require(furrr); options(mc.cores=18); plan(multicore)
+pathOut <- here::here("output/")
+
+future_map(1:18,
+  ~convertVCFtoDosage(pathIn=here::here("output/"),
+  pathOut=pathOut,
+  vcfName = paste0("chr",.,"_", reportName, "_WA_REFimputedAndFiltered")))
+  
+# Genome-wide dosage (for use in R) for each dataset
+createGenomewideDosage(pathIn=here::here("output/"), chroms=1:18, 
+  paste0("_", reportName, "_WA_REFimputedAndFiltered"))
+```

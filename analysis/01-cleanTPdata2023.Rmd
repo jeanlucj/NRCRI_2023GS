@@ -1,0 +1,566 @@
+---
+title: "Review and QC of NRCRI training data 2023"
+site: workflowr::wflow_site
+date: "2023-July-16"
+output: 
+  workflowr::wflow_html:
+    highlight: breezedark
+editor_options:
+  chunk_output_type: inline
+---
+## The big idea.  
+Should be able to start from on the work server and run this rmarkdown using  
+module load R/4.2.1-r9
+Rscript -e 'Sys.setenv(RSTUDIO_PANDOC="/usr/lib/rstudio-server/bin/quarto/bin/tools"); rmarkdown::render("/home/jj332/NRCRI_2023GS/analysis/01-cleanTPdata2023.Rmd")'  
+I don't know why, but if you try to knit this from RStudio, `here::here` trips
+over itself so things don't get properly saved to the home directory.  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = F, 
+                      tidy='styler', 
+                      tidy.opts=list(strict=FALSE,width.cutoff=100), 
+                      highlight=TRUE)
+netID <- "jj332"
+jobName <- "NRCRI_2023GS"
+```
+
+### Copy data.  
+Copy output from `00-ImputeDArT....Rmd` to the `data` folder.  
+Start with your scripts in a `workflow`-like directory structure with 
+`analysis`, `code`, `data`, and `output` subfolders in 
+`/home/netID/jobName`
+```{r copy files over}
+copyToDir <- paste0("/workdir/", netID, "/")
+copyToJob <- paste0(copyToDir, jobName, "/data/")
+homeJob <- paste0("/home/", netID, "/", jobName, "/")
+homeJobOut <- paste0(homeJob, "output/")
+
+dir.create(copyToDir)
+# Important to set overwrite=T in case you have to rerun the analysis with new files
+file.copy(from=homeJob, to=copyToDir, recursive=T, overwrite=T)
+
+# Now set the here::here base on the working server.  
+# This doesn't work interactively in RStudio.  
+setwd(paste0(copyToDir, jobName, "/analysis/"))
+here::i_am("analysis/01-cleanTPdata2023.Rmd")
+print(here::here())
+```
+
+Follow outlined GenomicPredictionChecklist and previous pipeline to process cassavabase data for ultimate genomic prediction.
+
+Below we will clean and format training data.
+
+-   Inputs: "Raw" field trial data
+-   Expected outputs: "Cleaned" field trial data
+
+# [User input] Cassavabase download
+
+Downloaded **all** NRCRI field trials.
+
+1. [Cassavabase search wizard](https://www.cassavabase.org/breeders/search):  
+2. *Breeding Programs* NRCRI.  
+3. *Trials* 376 trials.  
+4. List named **ALL_NRCRI_TRIALS16July2023**.  
+Downloading metadata OR data from the trials on this list leads to a server
+error.
+5. Try again: *Breeding Programs* NRCRI.  
+6. Year: *2012 to 2023*.  
+7. Trials: *Select All*.  
+8. List named **ALL_NRCRI_TrialsBackTo2012_2023July16**.  
+This seems to be downloading OK. Within 3 minutes I have a 27.9Mb file.  
+File in NRCRI_2023GS/data `ALL_NRCRI_TrialsBackTo2012_2023July16.csv`.  
+Also `ALL_NRCRI_TrialsBackTo2012_2023July16_metadata.csv`.  
+
+```{r Load libraries}
+library(tidyverse)
+source(here::here("code","gsFunctions.R"))
+print(here::here())
+```
+
+Read data directly from Cassavabase.  
+
+```{r read Cassavabase data}
+# 353 trial names
+dbTrialNames <- readLines(here::here("data","ALL_NRCRI_TrialsBackTo2012_2023July16.txt"))
+
+dbdata <- readDBdata(phenotypeFile= here::here("data","ALL_NRCRI_TrialsBackTo2012_2023July25.csv"))
+# 37054 obs. of 150 variables
+
+print("Trials with data")
+trialsYesData <- dbdata$studyName %>% unique
+trialsYesData %>% length %>% print
+trialsYesData %>% substr(1, 2) %>% table %>% print
+# 174 unique trial names
+print("Trials withOUT data")
+trialsNoData <- dbTrialNames[!(dbTrialNames %in% trialsYesData)]
+trialsNoData %>% length %>% print
+trialsNoData %>% substr(1, 2) %>% table %>% print
+
+# dbdataOld <- readDBdata(phenotypeFile = here::here("data","ALL_NRCRI_TrialsBackTo2012_2023July16.csv"))
+print(here::here())
+```
+
+# Group and select trials to analyze
+
+Make TrialType Variable
+
+```{r Make trialType}
+dbdata <- makeTrialTypeVar(dbdata) 
+dbdata %>% 
+  count(TrialType) %>% rmarkdown::paged_table()
+print(here::here())
+```
+
+## Trials NOT included
+Should look at these trials in particular to figure out if clones in them are 
+mostly genotyped
+```{r save not identified file names}
+dbdata %>% filter(is.na(TrialType)) %>%
+  pull(studyName) %>%
+  unique %>%
+  write.csv(
+    file=here::here("output","NRCRI_trials_NOT_identifiable2023.csv"),
+      row.names=F, quote=F)
+print(here::here())
+```
+
+## Remove unclassified trials
+
+```{r summarize remaining data}
+dbdata <- dbdata %>% 
+    filter(!is.na(TrialType)) 
+dbdata %>% 
+    group_by(programName) %>% 
+    summarize(N=n()) %>% rmarkdown::paged_table()
+#	34277 from NRCRI
+print(here::here())
+```
+
+Making a table of abbreviations for renaming
+
+```{r trait abbreviation table}
+traitabbrevs <- tribble(
+  ~TraitAbbrev, ~TraitName,
+  "CMD1S","cassava.mosaic.disease.severity.1.month.evaluation.CO_334.0000191",
+  "CMD3S","cassava.mosaic.disease.severity.3.month.evaluation.CO_334.0000192",
+  "CMD6S","cassava.mosaic.disease.severity.6.month.evaluation.CO_334.0000194",
+  "CMD9S","cassava.mosaic.disease.severity.9.month.evaluation.CO_334.0000193",
+  "CGM","Cassava.green.mite.severity.CO_334.0000033",
+  "CGMS1","cassava.green.mite.severity.first.evaluation.CO_334.0000189",
+  "CGMS2","cassava.green.mite.severity.second.evaluation.CO_334.0000190",
+  "DMC","dry.matter.content.percentage.CO_334.0000092",
+  "DMCsg","dry.matter.content.by.specific.gravity.method.CO_334.0000160",
+        "DRY", "dry.yield.CO_334.0000014",
+        "IVig1-5", "initial.plant.vigor.assessment.1.5.CO_334.0000220",
+        "IVig1-7", "initial.vigor.assessment.1.7.CO_334.0000009",
+  "PLTHT","plant.height.measurement.in.cm.CO_334.0000018",
+  "BRNHT1","first.apical.branch.height.measurement.in.cm.CO_334.0000106",
+  "SHTWT","fresh.shoot.weight.measurement.in.kg.per.plot.CO_334.0000016",
+  "RTWT","fresh.storage.root.weight.per.plot.CO_334.0000012",
+  "RTNO","root.number.per.plot.counting.CO_334.0000011",
+  "TCHART","total.carotenoid.by.chart.1.8.CO_334.0000161",
+  "NOHAV","plant.stands.harvested.counting.CO_334.0000010",
+  "StC", "starch.content.percentage.CO_334.0000071")
+
+traitabbrevs %>% rmarkdown::paged_table()
+print(here::here())
+```
+
+Run function `renameAndSelectCols()` to rename columns and remove everything
+unnecessary
+
+```{r rename and select}
+dbdata <- renameAndSelectCols(
+  traitabbrevs,
+  indata=dbdata,
+  customColsToKeep=c("TrialType","observationUnitName")
+  )
+print(here::here())
+```
+
+# QC Trait values
+
+```{r qc trait values}
+dbdata <- dbdata %>% 
+  mutate(CMD1S=ifelse(CMD1S<1 | CMD1S>5,NA,CMD1S),
+         CMD3S=ifelse(CMD3S<1 | CMD3S>5,NA,CMD3S),
+         CMD6S=ifelse(CMD6S<1 | CMD6S>5,NA,CMD6S),
+         CMD9S=ifelse(CMD9S<1 | CMD9S>5,NA,CMD9S),
+         # CBSD3S=ifelse(CBSD3S<1 | CBSD3S>5,NA,CBSD3S),
+         # CBSD6S=ifelse(CBSD6S<1 | CBSD6S>5,NA,CBSD6S),
+         # CBSD9S=ifelse(CBSD9S<1 | CBSD9S>5,NA,CMD9S),
+         # CBSDRS=ifelse(CBSDRS<1 | CBSDRS>5,NA,CBSDRS),
+         CGM=ifelse(CGM<1 | CGM>5,NA,CGM),
+         CGMS1=ifelse(CGMS1<1 | CGMS1>5,NA,CGMS1),
+         CGMS2=ifelse(CGMS2<1 | CGMS2>5,NA,CGMS2),
+         DMC=ifelse(DMC>100 | DMC<=0,NA,DMC),
+         DMCsg=ifelse(DMCsg>100 | DMCsg<=0,NA,DMCsg),
+         DRY = ifelse(DRY==0 | NOHAV==0 | is.na(NOHAV),NA,DRY),
+         `IVig1-5`=ifelse(`IVig1-5`<1 | `IVig1-5`>5,NA,`IVig1-5`),
+         `IVig1-7`=ifelse(`IVig1-7`<1 | `IVig1-7`>7,NA,`IVig1-7`),
+         RTWT=ifelse(RTWT==0 | NOHAV==0 | is.na(NOHAV),NA,RTWT),
+         SHTWT=ifelse(SHTWT==0 | NOHAV==0 | is.na(NOHAV),NA,SHTWT),
+         RTNO=ifelse(RTNO==0 | NOHAV==0 | is.na(NOHAV),NA,RTNO),
+         NOHAV=ifelse(NOHAV==0,NA,NOHAV),
+         NOHAV=ifelse(NOHAV>42,NA,NOHAV),
+         RTNO=ifelse(!RTNO %in% 1:10000,NA,RTNO),
+         StC=ifelse(StC>100 | StC<=0,NA,StC))
+print(here::here())
+```
+
+# Post-QC traits  
+
+### Harvest index
+
+```{r harvest index}
+dbdata <- dbdata %>% 
+    mutate(HI=RTWT/(RTWT+SHTWT))
+print(here::here())
+```
+
+## Unit area traits
+
+I anticipate this will not be necessary as it will be computed before or during data upload.
+
+For calculating fresh root yield per unit area:
+
+1.  **PlotSpacing:** Area in $m^2$ per plant. plotWidth and plotLength metadata would hypothetically provide this info, but is missing for vast majority of trials. Therefore, use info from Fola.
+2.  **maxNOHAV:** Instead of ExpectedNOHAV. Need to know the max number of plants in the area harvested. For some trials, only the inner (or "net") plot is harvested, therefore the PlantsPerPlot meta-variable will not suffice. Besides, the PlantsPerPlot information is missing for the vast majority of trials. Instead, use observed max(NOHAV) for each trial. We use this plus the PlotSpacing to calc. the area over which the RTWT was measured. During analysis, variation in the actual number of plants harvested will be accounted for.
+
+```{r plot spacing, message=F, warning=F}
+dbdata <- dbdata %>% 
+    mutate(PlotSpacing=ifelse(
+      programName!="IITA",1,
+      ifelse(studyYear<2013,1,
+             ifelse(TrialType %in% c("CET","GeneticGain","ExpCET"),1,0.8))))
+maxNOHAV_byStudy <- dbdata %>% 
+  group_by(programName,locationName,studyYear,studyName,studyDesign) %>% 
+  summarize(MaxNOHAV=max(NOHAV, na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(MaxNOHAV=ifelse(MaxNOHAV=="-Inf",NA,MaxNOHAV))
+
+write.csv(maxNOHAV_byStudy %>% arrange(studyYear),
+          file=here::here("output","maxNOHAV_byStudy.csv"), row.names = F)
+
+# Luciano has this, but I'm not sure if it's right:
+if (FALSE){
+  mutate(MaxNOHAV=ifelse(MaxNOHAV=="-Inf",NA,MaxNOHAV),
+         MaxNoHAV=ifelse(TrialType=="CET",
+                         yes = 5,
+                         no = ifelse(TrialType=="PYT",
+                                     yes = 10,
+                                     no = ifelse(TrialType=="AYT",
+                                                 yes = 20,
+                                                 no = ifelse(TrialType=="UYT",
+                                                             yes = 36,
+                                                             no = MaxNOHAV)))))
+}
+print(here::here())
+```
+
+**This next part is [copied from 2020 NRCRI analysis](https://wolfemd.github.io/NRCRI_2020GS/06-cleanTPdata.html#Post-QC_traits)**
+
+> Previously, I took these values *as is*. I am unsatisfied with that. The trial
+number is small enough I'm going to curate manually below. I hope this gives
+better yield results.  
+
+```{r manually curate maxNOHAV}
+maxNOHAV_byStudy <- maxNOHAV_byStudy %>%
+  mutate(MaxNOHAV=ifelse(studyName=="18C2acrossingblockCETubiaja",8,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="13TP1CET518kano",5,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="17C1aAYTGSkano",10,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="18C1bAYTGSOtobi",10,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="16C1aCETnonGSOtobi",5,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="17C1bCETkano",5,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="16C1aCETnonGSOtobi",5,MaxNOHAV),
+         MaxNOHAV=ifelse(studyName=="18C1bAYTGSset2umu",10,MaxNOHAV))
+print(here::here())
+```
+
+Now back the standard workflow.
+
+```{r log transform yield traits}
+# I log transform yield traits 
+# to satisfy homoskedastic residuals assumption 
+# of linear mixed models
+dbdata <- left_join(dbdata,maxNOHAV_byStudy) %>% 
+  mutate(RTWT=ifelse(NOHAV>MaxNOHAV,NA,RTWT),
+         SHTWT=ifelse(NOHAV>MaxNOHAV,NA,SHTWT),
+         RTNO=ifelse(NOHAV>MaxNOHAV,NA,RTNO),
+         HI=ifelse(NOHAV>MaxNOHAV,NA,HI),
+         FYLD=RTWT/(MaxNOHAV*PlotSpacing)*10,
+         DYLD=FYLD*(DMC/100),
+         DRYsgLD=FYLD*(DMCsg/100),
+         logFYLD=log(FYLD),
+         logDYLD=log(DYLD),
+         logDRYsgLD=log(DRYsgLD),
+         logTOPYLD=log(SHTWT/(MaxNOHAV*PlotSpacing)*10),
+         logRTNO=log(RTNO),
+         PropNOHAV=NOHAV/MaxNOHAV) 
+# remove non transformed / per-plot (instead of per area) traits
+dbdata <- dbdata %>% select(-RTWT,-SHTWT,-RTNO,-FYLD,-DYLD)
+print(here::here())
+```
+
+## Season-wide mean disease severity
+
+```{r season-wide CMD}
+# [NEW AS OF APRIL 2021]
+## VERSION with vs. without CBSD
+## Impervious to particular timepoints between 1, 3, 6 and 9 scores
+
+# Without CBSD (West Africa)
+# July 26, 2023: dbdata 34582 by 43 variables
+dbdata <- dbdata %>% 
+  mutate(MCMDS=rowMeans(.[,colnames(.) %in% c("CMD1S","CMD3S","CMD6S","CMD9S")], na.rm = T)) %>% 
+  select(-any_of(c("CMD1S","CMD3S","CMD6S","CMD9S")))
+
+# With CBSD (East Africa)
+# dbdata <- dbdata %>% 
+#   mutate(MCMDS=rowMeans(.[,colnames(.) %in% c("CMD1S","CMD3S","CMD6S","CMD9S")], na.rm = T),
+#          MCBSDS=rowMeans(.[,colnames(.) %in% c("CBSD1S","CBSD3S","CBSD6S","CBSD9S")], na.rm = T)) %>% 
+#   select(-any_of(c("CMD1S","CMD3S","CMD6S","CMD9S","CBSD1S","CBSD3S","CBSD6S","CBSD9S")))
+print(here::here())
+```
+
+# Assign genos to phenos
+Previously `Assign genos to phenos` separated out work with GBS then added DArT
+Here, I am just going to work with imputed DosageMatrix datasets.
+The idea:  
+1. Pull together all of the genotypes in dosage matrices  
+  a. Extract germplasmNames from the rownames which tend to be FullSampleNames.  
+  b. Remove redundant germplasmNames. Better would be to look at the marker
+  score correlations across identical germplasmNames and average ones that look
+  like they are the same, discard ones that look different. Oh well.  
+2. Intersect that with all of the phenotypes in `dbdata` on the basis of
+germplasmNames
+  a. NOTE: These steps should be done after calculation of BLUPs.  
+3. Union with all of the new NRCRI genotypes that have DArT markers  
+
+I'm going to get clone names from row names of the dosage matrices
+marnin > NRCRI_2020GS > output
+DosageMatrix_DCas20_5440_WA_REFimputedAndFiltered.rds
+DosageMatrix_DCas20_5510_WA_REFimputedAndFiltered.rds
+marnin > NRCRI_2021GS > output
+DosageMatrix_DCas21_5841_WA_REFimputedAndFiltered.rds
+lbraatz > NRCRI_2022GS > output
+DosageMatrix_DCas22_7085_WA_REFimputedAndFiltered.rds
+jj332 > NRCRI_2023GS > output
+DosageMatrix_DCas23-8175_WA_REFimputedAndFiltered.rds
+```{r Step 1. NRCRI clones with DArT dosage}
+casBase <- "/home/jj332_cas/"
+outputDirs <- c("marnin/NRCRI_2020GS/output/",
+                "marnin/NRCRI_2020GS/output/",
+                "marnin/NRCRI_2021GS/output/",
+                "lbraatz/NRCRI_2022GS/output/",
+                "jj332/NRCRI_2023GS/output/")
+dosMatNames <- c("DosageMatrix_DCas20_5440_WA_REFimputedAndFiltered.rds",
+                 "DosageMatrix_DCas20_5510_WA_REFimputedAndFiltered.rds",
+                 "DosageMatrix_DCas21_5841_WA_REFimputedAndFiltered.rds",
+                 "DosageMatrix_DCas22_7085_WA_REFimputedAndFiltered.rds",
+                 "DosageMatrix_DCas23-8175_WA_REFimputedAndFiltered.rds")
+
+allDosMat <- list()
+for (i in 1:length(outputDirs)){
+  print(i)
+  allDosMat[[i]] <- readRDS(paste0(casBase, outputDirs[i], dosMatNames[i]))
+  print(dim(allDosMat[[i]]))
+}
+print(here::here())
+```
+
+### Extract germplasmName from DosageMatrix rowname
+- If it has a : separate by colon and take the first substring.  
+- If it has a ... separate by ... and take the second substring.  
+- If it has a _ separate by _ and take the first substring.  
+```{r Step 1. Extract germplasmName from DosageMatrix}
+extractGermNameFromRowName <- function(rn){
+  if (grepl(":", rn, fixed=T)){
+    return(strsplit(rn, ":", fixed=T)[[1]][1])
+  }
+  if (grepl("...", rn, fixed=T)){
+    return(strsplit(rn, "...", fixed=T)[[1]][2])
+  }
+  if (grepl("_", rn, fixed=T)){
+    return(strsplit(rn, "_", fixed=T)[[1]][1])
+  }
+  return(rn)
+}
+
+# Take clone names from a dosage matrix that has DArT markers (NOT GBS!)
+# and get the clone name from it
+extractGermNames <- function(dosmat){
+  germNames <- sapply(rownames(dosmat), extractGermNameFromRowName)
+  return(tibble(germplasmName=germNames, 
+                FullSampleName=rownames(dosmat)))
+}
+
+dartNamesNRCRI <- tibble()
+for (i in 1:length(allDosMat)){
+  dartNamesNRCRI <- 
+    dplyr::bind_rows(dartNamesNRCRI, allDosMat[[i]] %>% extractGermNames)
+}
+dartNamesNRCRI <- dartNamesNRCRI %>% dplyr::distinct(germplasmName, .keep_all=T)
+# 5632 NRCRI clones have been genotyped with DArT (1 of them twice...)
+print(here::here())
+```
+
+### Make a single matrix with the dosages from NRCRI
+Across all the imputed dosage matrices, keep the SNPs in common (intersect)
+```{r Step 1. Single matrix all DArT dosage}
+commonSNPnames <- colnames(allDosMat[[1]])
+for (i in 2:length(allDosMat))
+  commonSNPnames <- commonSNPnames %>% dplyr::intersect(colnames(allDosMat[[i]]))
+
+allMrkNRCRI <- NULL
+for (i in 1:length(allDosMat))
+  allMrkNRCRI <- rbind(allMrkNRCRI, allDosMat[[i]][,commonSNPnames])
+# row names have the full sample name so none are actually duplicated
+allMrkNRCRI <- allMrkNRCRI[!duplicated(rownames(allMrkNRCRI)),]
+dim(allMrkNRCRI)
+# 5633 17415
+allMrkNRCRI %>% 
+  saveRDS(file=here::here("output","DosageMatrix_NRCRI_2023July26.rds"))
+print(here::here())
+```
+
+## Assemble GBS+DArT imputed dosages.  
+This has more germplasmNames than are relevant for prediction for NRCRI
+```{r Step 1. Assemble GBS+DArT imputed dosages}
+# Compare with what Luciano worked with in 2022
+dosMatRefPopImp22 <- 
+  readRDS("/home/jj332_cas/lbraatz/NRCRI_2022GS/output/DosageMatrix_DCas22_7085RefPopImputed.rds")
+dim(dosMatRefPopImp22)
+# 18624 84957
+# Luciano clearly did something different with the SNPs... fudge
+dosMatLucGN <- extractGermNames(dosMatRefPopImp22)
+sum(dbdata$germplasmName %in% dosMatLucGN$germplasmName)
+# 14054
+
+# The complete dosage matrix for markers prior to the DArT era is
+# "DosageMatrix_RefPanelAndGSprogeny_ReadyForGP_73019.rds"
+# I have to get germplasmName out of that
+dosMat2019 <- 
+  readRDS("/home/jj332_cas/CassavaGenotypeData/nextgenImputation2019/ImputationStageIII_72619/DosageMatrix_RefPanelAndGSprogeny_ReadyForGP_73019.rds")
+dmrn <- rownames(dosMat2019)
+# 21856
+# Were dashes replaced by dots? Yes.
+has.TMS. <- grep(".TMS.", dmrn, fixed=T)
+# 78 .TMS. should be replaced with -TMS-
+grep(".TMS.", dbdata$germplasmName, fixed=T) # None in the germplasmName
+rownames(dosMat2019)[has.TMS.] <- dmrn[has.TMS.] <- 
+  gsub(".TMS.", "-TMS-", rownames(dosMat2019[has.TMS.,]))
+# Explore a little what the names of this old dosage matrix look like
+set.seed(2023)
+# With : versus ... versus _
+hasColon <- grep(":", dmrn, fixed=T)
+dmrn[hasColon[sample(length(hasColon), 20)]]
+# 15017
+hasDotDot <- grep("...", dmrn, fixed=T)
+dmrn[hasDotDot[sample(length(hasDotDot), 20)]]
+# 4234 no overlap with hasColon
+hasUnder <- setdiff(grep("_", dmrn, fixed=T), union(hasColon, hasDotDot))
+dmrn[hasUnder[sample(length(hasUnder), 20)]]
+# 2521
+remaining <- setdiff(1:length(dmrn), union(union(hasColon, hasDotDot), hasUnder))
+dmrn[remaining]
+# 84 What remains are straight up germplasmName
+
+# Make a dosMat with ALL the markers
+commonSNPnames <- commonSNPnames %>% dplyr::intersect(colnames(dosMat2019))
+allMrkALL <- rbind(allMrkNRCRI[,commonSNPnames], dosMat2019[,commonSNPnames])
+dim(allMrkALL)
+# 27489 16391
+# Change rownames from FullSampleName to germplasmName
+rownames(allMrkALL) <- sapply(rownames(allMrkALL), extractGermNameFromRowName)
+allMrkALL <- allMrkALL[!duplicated(rownames(allMrkALL)),]
+dim(allMrkALL)
+# 26664 16391
+allMrkALL %>% 
+  saveRDS(file=here::here("output","DosageMatrix_ALL_2023July28.rds"))
+
+filesToMoveHome <- c("DosageMatrix_ALL_2023July28.rds",
+                     "DosageMatrix_NRCRI_2023July26.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+print(here::here())
+```
+
+## Make a dosage matrix relevant for NRCRI prediction.  
+Keep only germplasmNames for which we have phenotypes and then add on the
+NRCRI genotypes
+```{r Dosage matrix for NRCRI prediction}
+# Keep all germplasmNames that have been phenotyped
+allMrkNRCRIpred <- allMrkALL[rownames(allMrkALL) %in% dbdata$germplasmName,]
+dim(allMrkNRCRIpred)
+# 2488 16391
+# Add on the germplasmNames to be predicted
+allMrkNRCRIpred <- rbind(allMrkNRCRIpred[, commonSNPnames],
+                         allMrkNRCRI[, commonSNPnames])
+sum(duplicated(rownames(allMrkNRCRIpred)))
+# 0
+dim(allMrkNRCRIpred)
+# 8121 16391
+
+fileName <- "DosageMatrix_NRCRIpred_2023July28.rds"
+saveRDS(allMrkNRCRIpred, file=here::here("output", fileName))
+outputFileNames <- c(dosMatPred=fileName)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileName, "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+print(here::here())
+```
+
+### What phenotypes are lost by only keeping germplasmName in rownames(allMrkALL)
+Fudge.  A lot of it looks like legitimate stuff
+Where is it getting lost?
+1. The datasets like IITA_GBStoPheno, NRCRI_GBStoPheno, GBSdataMasterList are
+all what was submitted, not what was imputed. So some might have gotten lost
+in the imputation shuffle.  
+2. I might be messing up in the translation of DosageMatrix rownames to 
+germplasmNames.  
+3. There might be some imputed datasets out there that I am missing.  
+Some visual checking suggests that hypothesis 2 should be rejected.  
+For hypothesis 3, if I am missing them, so was Luciano as best I can tell.  
+That leaves hypothesis 1, which I can't do anything about.  
+See `quickLookAtPhenoNotInGeno.R` to see what will be missing from the 
+phenotyped data once we require matching with genotypes
+
+```{r Step 2. Intersect with phenotypes}
+# Minor manual curating: the phenotyped data from 2015 left out the "C1a" that
+# is in the germplasmName from genotyping
+dbdata <- dbdata %>% mutate(
+  germplasmName=if_else(grepl("NR15F", germplasmName),
+                        paste0("NR15C1a", substring(germplasmName, 5)),
+                        germplasmName))
+
+# Make a single matrix with ALL the dosages
+sum(dbdata$germplasmName %in% rownames(allMrkALL))
+# dbdata has 34582 observations. 17046 observations have matches in allMrkALL 
+#   losing more than half the observations...
+print(here::here())
+```
+
+## Output "cleaned" file
+
+```{r saveRDS dbdata}
+fileName <- "NRCRI_CleanedTrialData_2023Jul26.rds"
+saveRDS(dbdata, file=here::here("output", fileName))
+outputFileNames <- c(outputFileNames, cleanedTrials=fileName)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileName, "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+print(here::here())
+```
+
+# Next step
+
+2.  [Get BLUPs combining all trial data](02-GetBLUPs.html): Combine data from all trait-trials to get BLUPs for downstream genomic prediction.
+
+    -   Fit mixed-model to multi-trial dataset and extract BLUPs, de-regressed BLUPs and weights. Include two rounds of outlier removal.

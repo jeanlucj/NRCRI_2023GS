@@ -1,0 +1,231 @@
+---
+title: "Check prediction accuracy"
+author: "LucianoRogerio and Jean-Luc Jannink"
+date: "2023-07-27"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+## The big idea.  
+Should be able to start from on the work server and run this rmarkdown using  
+module load R/4.2.1-r9
+Rscript -e 'Sys.setenv(RSTUDIO_PANDOC="/usr/lib/rstudio-server/bin/quarto/bin/tools"); rmarkdown::render("/home/jj332/NRCRI_2023GS/analysis/03-CrossValidation2023.Rmd")'  
+
+## Setup.  
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = F,
+  tidy.opts=list(strict=FALSE,width.cutoff=100), highlight=TRUE)
+rm(list=ls())
+library(tidyverse); library(magrittr); library(data.table) 
+library(genomicMateSelectR)
+
+netID <- "jj332"
+jobName <- "NRCRI_2023GS"
+outputFileNames <- readRDS(paste0("~/", jobName, "/output/OutputFileNames.rds"))
+```
+
+### Copy data.  
+Copy output from `02-GetBlups2023.Rmd` to the `data` folder.  
+Start with your scripts in a `workflow`-like directory structure with 
+`analysis`, `code`, `data`, and `output` subfolders in 
+`/home/netID/jobName`
+```{r copy files over}
+copyToDir <- paste0("/workdir/", netID, "/")
+homeJob <- paste0("/home/", netID, "/", jobName, "/")
+homeJobOut <- paste0(homeJob, "output/")
+
+dir.create(copyToDir)
+# Important to set overwrite=T in case you have to rerun the analysis with new files
+file.copy(from=homeJob, to=copyToDir, recursive=T, overwrite=T)
+
+# Now set the here::here base on the working server
+setwd(paste0(copyToDir, jobName, "/analysis/"))
+here::i_am("analysis/03-CrossValidation2023.Rmd")
+```
+
+## Previous step
+
+2. [Get BLUPs combining all trial data](getBlups.html): Combine data from all trait-trials to get BLUPs for downstream genomic prediction.
+Fit mixed-model to multi-trial dataset and extract BLUPs, de-regressed BLUPs and weights. Include two rounds of outlier removal.
+
+## Cross-validation
+5-fold cross-validation. Replicate 5-times.
+
+2 genomic models:
+
+Additive-only (**A**)
+Addititive plus dominance plus additive-by-dominance epistasis (**ADE**)
+
+## Prep. genomic data
+
+## Get SNP data from FTP
+
+The data for the next step can be found on the cassavabase FTP server here.
+
+Can be loaded directly to R from FTP.
+
+**NOTICE**: You need enough RAM and a stable network connection. I do the next steps, including cross-validation on a server with plenty of RAM and a good, stable network connection, rather than on my personal computer (a laptop with 16 GB RAM).
+
+The outputs (kinship matrices and filtered snp dosages) of the steps below, which are too large for GitHub, I have it saved in biohpc server in jj332_cas directory.
+
+```{r Set system threads}
+# activate multithread OpenBLAS for fast compute of SigmaM (genotypic var-covar matrix)
+# cd /home/jj332_cas/lbraatz/NRCRI_2022GS/; 
+system("export OMP_NUM_THREADS=56")
+```
+
+```{r Prep the datasets}
+snps <- readRDS(here::here("output", "DosageMatrix_NRCRIpred_2023July28.rds"))
+dim(snps)
+# MAF filter of 1%
+snps <- snps %>% maf_filter(0.01)
+dim(snps)
+
+blups <- readRDS(here::here("output",
+         "NRCRI_blupsForModelTraining_twostage_asreml_2023Jul27.rds"))
+
+# genotypes with no phenotypes: yes -> prediction
+# phenotypes with no genotypes: no: we aren't doing H matrix or anything
+# Make sure you only have phenotypes for germplasmNames that you have genotypes
+blups <- blups %>% 
+  select(Trait, blups) %>% 
+  unnest(blups) %>% 
+  select(-std.error) %>% 
+  filter(GID %in% rownames(snps))
+```
+
+## Make Add, Dom and Epi kinships
+
+Going to use my own kinship function.
+
+Make the kinships.
+
+Below e.g. A*A makes a matrix that approximates additive-by-additive epistasis relationships.
+
+```{r Create Relationship Matrix}
+A <- kinship(snps,type="add")
+D <- kinship(snps,type = "domClassic")
+AD <- A*D
+
+fileNameA <- "Kinship_A_NRCRI_2023Jul28.rds"
+fileNameD <- "Kinship_D_NRCRI_2023Jul28.rds"
+fileNameAD <- "Kinship_AD_NRCRI_2023Jul28.rds"
+saveRDS(A,file=here::here("output",fileNameA))
+saveRDS(D,file=here::here("output",fileNameD))
+saveRDS(AD,file=here::here("output",fileNameAD))
+outputFileNames <- c(outputFileNames, 
+                     kinshipA=fileNameA,
+                     kinshipD=fileNameD,
+                     kinshipAD=fileNameAD)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileNameA, fileNameD, fileNameAD,
+                     "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+
+# Only do the lines below if restarting code
+restarting <- FALSE
+if (restarting){
+  A <- readRDS(file="~/NRCRI_2023GS/output/Kinship_A_NRCRI_2023Jul28.rds")
+  D <- readRDS(file="~/NRCRI_2023GS/output/Kinship_D_NRCRI_2023Jul28.rds")
+  AD <- readRDS(file="~/NRCRI_2023GS/output/Kinship_AD_NRCRI_2023Jul28.rds")
+}
+```
+
+**NOTICE**: The outputs (kinship matrices and filtered snp dosages) of the steps
+below, which are too large for GitHub, I left all the data on the on the
+jj332_cas directory on the biohpc server, please contact me if you need the
+data.
+
+## Cross-validation
+
+### Set-up training-testing data
+
+```{r Make cv2do}
+# Hmmm: if we have genomicMateSelectR why also source gsFuncations?
+# I am going to attempt to use the gsFunctions: at least they are documented
+# source(here::here("code","gsFunctions.R"))
+
+cv2do <- blups %>%
+  nest(TrainingData=-Trait)
+cv2do %>% rmarkdown::paged_table()
+
+cv2do$TrainingData[[6]] %>% head %>% rmarkdown::paged_table()
+```
+
+The function below runCrossVal() function implements nfold cross-validation. Specifically, for each of nrepeats it splits the data into nfolds sets according to gid. So if nfolds=5 then the the clones will be divided into 5 groups and 5 predictions will be made. In each prediction, 4/5 of the clones will be used to predict the remaining 1/5. Accuracy of the model is measured as the correlation between the BLUPs (adj. mean for each CLONE) in the test set and the GEBV (the prediction made of each clone when it was in the test set).
+
+Below, 20 reps x 5-fold cross-validation are run on 1 large memory Cornell CBSU machine each (e.g. cbsulm29; 104 cores, 512 GB RAM).
+
+## CV - modelType = “A”
+
+```{r Run additive cross validations}
+starttime <- proc.time()[3]
+# Don't do CGM because there wasn't adequate data for it. Not sure why
+cv_A <- runCrossVal(cv2do %>% dplyr::filter(Trait != "CGM"),
+                            modelType="A",
+                            selInd=F,
+                            grms=list(A=A),
+                            byGroup=FALSE,
+                            augmentTP=NULL,
+                            nrepeats=20,nfolds=5,ncores=25,
+                            gid="GID")
+runtime <- proc.time()[3]-starttime; runtime
+
+cv_A <- cv_A %>% mutate(modelType="A")
+fileName <- "cvresults_A_2023Jul28.rds"
+saveRDS(cv_A, file=here::here("output", fileName))
+outputFileNames <- c(outputFileNames, crossValResults=fileName)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileName, "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+```
+
+## CV - modelType = “ADE”
+
+```{r Additive dominance AD cross validation, eval=FALSE}
+# split it to two tranches of 10 reps
+ 
+options(future.globals.maxSize= 3000*1024^2)
+D <- readRDS(file=here::here("output","Kinship_D_NRCRI_2023Jul28.rds"))
+AD <- readRDS(file=here::here("output","Kinship_AD_NRCRI_2023Jul28.rds"))
+starttime <- proc.time()[3]
+cv_ADE_1 <- cv2do %>% 
+  mutate(CVresults=
+           map(TrainTestData,
+               ~runCrossVal(TrainTestData=.,
+                            modelType="ADE",
+                            grms=list(A=A,D=D,AD=AD),
+                            byGroup=FALSE,
+                            augmentTP=NULL,
+                            nrepeats=10,nfolds=5,ncores=5,
+                            gid="germplasmName")))
+cv_ADE_1 %<>% mutate(modelType="ADE") %>% dplyr::select(-TrainTestData)
+saveRDS(cv_ADE_1,file=here::here("output","cvresults_ADE_1_2023Jul28.rds"))
+runtime <- proc.time()[3]-starttime; runtime
+
+starttime <- proc.time()[3]
+cv_ADE_2 <- cv2do %>% 
+  mutate(CVresults=
+           map(TrainTestData,
+               ~runCrossVal(TrainTestData=.,
+                            modelType="ADE",
+                            grms=list(A=A,D=D,AD=AD),
+                            byGroup=FALSE,
+                            augmentTP=NULL,
+                            nrepeats=10,nfolds=5,ncores=5,
+                            gid="germplasmName")))
+cv_ADE_2 %<>% mutate(modelType="ADE") %>% dplyr::select(-TrainTestData)
+saveRDS(cv_ADE_2,file=here::here("output","cvresults_ADE_2_2023Jul28.rds"))
+runtime <- proc.time()[3]-starttime; runtime
+```
+
+## Next step
+
+4. [Genomic prediction](getGBLUPs.html): Predict genomic BLUPs (GEBV and GETGV) for all selection candidates using all available data.

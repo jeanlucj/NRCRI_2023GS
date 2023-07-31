@@ -1,0 +1,255 @@
+---
+title: "Results"
+author: "LucianoRogerio and Jean-Luc Jannink"
+date: "2023-07-30"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup.  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = F,
+  tidy.opts=list(strict=FALSE,width.cutoff=100), highlight=TRUE)
+rm(list=ls())
+library(tidyverse); library(magrittr); library(genomicMateSelectR)
+
+netID <- "jj332"
+jobName <- "NRCRI_2023GS"
+outputFileNames <- readRDS(paste0("~/", jobName, "/output/OutputFileNames.rds"))
+for (i in 1:length(outputFileNames))
+  assign(names(outputFileNames)[i], outputFileNames[i])
+```
+
+## Raw data.  
+NOTE: All other .Rmd files copy files over from /home/netID to the local
+workdir, set here::here to the local workdir, then source data locally.  
+For these results, the assumption is that all previous .Rmd scripts have saved
+their results over to /home/netID and that those results should be pulled from
+there directly.  
+
+Summary of the number of unique plots, locations, years, etc. in the cleaned plot-basis data. See here for details..
+```{r Raw data Info, warning = FALSE, error = FALSE}
+rawdata <- readRDS(paste0("/home/", netID, "/" , jobName,
+                          "/output/", exptDesigns))
+rawdata %>% 
+  summarise(Nplots=nrow(.),
+            across(c(locationName,studyYear,studyName,TrialType,GID), ~length(unique(.)),.names = "N_{.col}")) %>% 
+  rmarkdown::paged_table()
+```
+
+8793 unique clone names in the phenotype data, across >57K plots.
+
+This is not the same number of clones as are expected to be genotyped-and-phenotyped.
+
+Break down the plots based on the trial design and TrialType (really a grouping of the population that is breeding program specific), captured by two logical variables, CompleteBlocks and IncompleteBlocks.
+
+```{r Experimental Designs}
+rawdata %>% 
+  count(TrialType,CompleteBlocks,IncompleteBlocks) %>% 
+  spread(TrialType,n) %>% 
+  rmarkdown::paged_table()
+```
+
+Next, look at breakdown of plots by TrialType (rows) and locations (columns):
+
+```{r Info Trial Type vs Locations}
+rawdata %>% 
+  count(locationName,TrialType) %>% 
+  spread(locationName,n) %>% 
+  rmarkdown::paged_table()
+```
+
+```{r Traits Distribution}
+traits <- c("DMC", "DRY", "PLTHT", "BRNHT1", "logFYLD",
+          "CGMS1", "CGMS2", "MCMDS", "DMCsg", "IVig1-7",
+          "StC", "HI", "logDRYsgLD", "logTOPYLD")
+rawdata %>% 
+  select(locationName,studyYear,studyName,TrialType,any_of(traits)) %>% 
+  pivot_longer(cols = any_of(traits), values_to = "Value", names_to = "Trait") %>% 
+  ggplot(.,aes(x=Value,fill=Trait)) + geom_histogram() + facet_wrap(~Trait, scales='free') + 
+  theme_bw() + scale_fill_viridis_d() + 
+  labs(title = "Distribution of Raw Phenotypic Values")
+```
+
+How many genotyped-and-phenotyped clones?
+
+```{r Clones Genotyped and phenotyped}
+rawdata %>% 
+  select(any_of(c("locationName","studyYear","studyName","TrialType",
+                "germplasmName","FullSampleName","GID")),
+         any_of(traits)) %>% 
+  pivot_longer(cols = any_of(traits), values_to = "Value", names_to = "Trait") %>%
+  filter(!is.na(Value)) %>%
+  distinct(germplasmName, GID) %>% 
+  rmarkdown::paged_table()
+```
+There are 2,083 genotyped-and-phenotyped clones!
+
+Table of germplasmName-DNA-sample-name matches are here: output/OnlyChosen_germplasmName_to_FullSampleName_matches_NRCRI_2022Jul09.csv.
+
+List of DNA-sample-names are here:
+
+1. RefPanel (containing NRCRI TP):
+2. New samples (DCAs22-7085):
+
+## BLUPs
+
+These are the BLUPs combining data for each clone across trials/locations without genomic information, used as input for genomic prediction downstream.
+
+```{r BLUPs Info}
+blups <- readRDS(paste0("/home/", netID, "/" , jobName,
+                        "/output/", blupsForTraining)) 
+
+blups %>% 
+  left_join(nestDesignsDetectedByTraits(rawdata,traits) %>% 
+  mutate(Nplots=map_dbl(MultiTrialTraitData,nrow)) %>% 
+    select(Trait,Nplots)) %>% 
+  mutate(Nclones=map_dbl(blups,~nrow(.)),
+         NoutliersRemoved=map2_dbl(outliers1,outliers2,~length(.x)+length(.y))) %>% 
+  #relocate(c(Nclones,NoutliersRemoved),.after = Trait) %>% 
+  #select(-blups,-varcomp,-outliers1,-outliers2) %>% 
+  select(Trait,Nplots,Nclones,NoutliersRemoved,Vg,Ve,H2) %>% 
+  mutate(across(is.numeric,~round(.,4))) %>% arrange(desc(H2)) %>% 
+  rmarkdown::paged_table()
+
+blups %>% 
+  select(Trait,blups) %>% 
+  unnest(blups) %>% 
+  ggplot(.,aes(x=drgBLUP,fill=Trait)) + geom_histogram() + facet_wrap(~Trait, scales='free') + 
+  theme_bw() + scale_fill_viridis_d() + 
+  labs(title = "Distribution of de-regressed BLUP Values")
+
+blups %>% 
+  select(Trait,blups) %>% 
+  unnest(blups) %>% 
+  ggplot(.,aes(x=Trait,y=REL,fill=Trait)) + geom_boxplot(notch=T) + #facet_wrap(~Trait, scales='free') + 
+  theme_bw() + scale_fill_viridis_d() + theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Distribution of BLUP Reliabilities")
+```
+
+## Marker density and distribution
+
+```{r Marker density}
+snps <- readRDS(paste0("/home/", netID, "/" , jobName,
+                       "/output/", dosMatPred))
+mrks <- colnames(snps) %>% 
+  tibble(SNP_ID=.) %>% 
+  separate(SNP_ID,c("Chr","Pos","Allele"),"_") %>% 
+  mutate(Chr=as.integer(gsub("S","",Chr)),
+         Pos=as.numeric(Pos))
+mrks %>% 
+  ggplot(.,aes(x=Pos,fill=as.character(Chr))) + geom_histogram() + 
+  facet_wrap(~Chr,scales = 'free') + theme_bw() + 
+  scale_fill_viridis_d() + theme(legend.position = 'none',axis.text.x = element_text(angle=90))
+mrks %>% count(Chr) %>% rmarkdown::paged_table()
+```
+
+## Prediction accuracy
+
+Check prediction accuracy: Evaluate prediction accuracy with cross-validation.
+
+```{r Prediction Accuracy}
+cv <- readRDS(paste0("/home/", netID, "/" , jobName,
+                     "/output/", crossValResults)) %>% 
+#  bind_rows(readRDS(here::here("output","cvresults_ADE_1_2022Jul10.rds"))) %>% 
+#  bind_rows(readRDS(here::here("output","cvresults_ADE_2_2022Jul10.rds"))) %>% 
+  unnest(accuracyEstOut) %>% 
+  dplyr::select(-splits)
+
+# cv %<>% 
+#  mutate(Trait=factor(Trait,levels=traits),
+#         modelType=factor(modelType,levels=c("A","ADE")))
+```
+
+
+## Table of mean accuracies
+
+
+5-fold cross-validation, replicated 20 times.
+
+Mean accuracy and upper/lower 95% interval.
+
+Two prediction models: A (additive-only) and ADE (additive + dominance + additive-by-dominance epistasis).
+
+```{r Mean cross validation accuracies}
+cv %>% 
+  group_by(Trait,modelType) %>% 
+  # use accGETGV. For modelA we GETGV==GEBV. For modelADE we don't want GEBV, just GETGV.
+  # 30 July 2023: don't have accGETGV because didn't do it yet...
+  summarize(meanAccuracy=mean(Accuracy,na.rm=T),
+            lower5pct=quantile(Accuracy,probs = c(0.05),na.rm=T),
+            upper5pct=quantile(Accuracy,probs = c(0.95),na.rm=T)) %>% 
+  mutate(across(is.numeric,~round(.,2))) %>% arrange(modelType,desc(meanAccuracy)) %>% 
+  rmarkdown::paged_table()
+```
+
+## Boxplot of accuracies
+
+
+5-fold cross-validation, replicated 20 times.
+
+Two prediction models: A (additive-only) and ADE (additive + dominance + additive-by-dominance epistasis).
+
+
+```{r Accuracy boxplots}
+# Again, no accGETGV, only Accuracy
+cv %>% 
+    ggplot(.,aes(x=Trait,y=Accuracy,fill=modelType)) + 
+  geom_boxplot(position = "dodge2",color='gray50',size=0.5, notch = T) + 
+  geom_hline(yintercept = 0, color='darkred') + 
+  theme_bw() + 
+  theme(strip.text.x = element_text(face='bold', size=12),
+        axis.text.y = element_text(face='bold', size=14, angle = 0),
+        axis.text.x = element_text(face='bold', size=18, angle = 90, hjust = 1),
+        axis.title.y = element_text(face='bold', size=12),
+        plot.title = element_text(face='bold'),
+        legend.text = element_text(face='bold',size=16),
+        legend.title = element_text(face='bold',size=16),
+        legend.position = 'bottom') + 
+  scale_fill_viridis_d() + 
+  labs(title="Prediction Accuracies", y="GEBV or GETGV accuracy",x=NULL) +
+  geom_hline(yintercept = 0, color='darkred')
+```
+
+1. Accuracy estimates are most improved relative to previously. I didn’t run the precise cross-validation folds so the judgement is based on visual comparison to the Dec. 2020 plot.
+2. DYLD and FYLD are not well predicted and I would not recommend using them based on selection.
+
+
+## Genetic Gain
+
+```{r Genetic Gain}
+gebvs <- read.csv(
+  paste0("~/", jobName, "/output/GEBV_NRCRI_ModelA_2023Jul30.csv"),
+  stringsAsFactors = F) %>% 
+  pivot_longer(cols = any_of(traits),names_to="Trait", values_to="GEBV")
+
+gebvs %<>% 
+  mutate(Trait=factor(Trait,levels=traits),
+         Group=factor(Group,levels=c("nrTP","C1a","C1b","C2a","C2b","C3a","C3b", "C4a","C4b")))
+
+gebvs %>% 
+  group_by(Trait, Group) %>% 
+  summarize(meanGEBV = mean(GEBV), 
+            stdErr = sd(GEBV)/sqrt(n()), 
+            upperSE = meanGEBV + stdErr, 
+            lowerSE = meanGEBV - stdErr) %>% 
+  ggplot(., aes(x = Group, 
+                y = meanGEBV, 
+                fill = Trait)) + 
+  geom_bar(stat = "identity", color = "gray60", 
+           size = 1.25) + 
+  geom_linerange(aes(ymax=upperSE, ymin=lowerSE), color="gray60", size = 1.25) + 
+  facet_wrap(~Trait, scales = "free") + 
+  theme_bw() + 
+  geom_hline(yintercept = 0, size = 1.15, color = "black") + 
+  theme(axis.text.x = element_text(face = "bold", angle = 90, size = 12), 
+        axis.title.y = element_text(face = "bold", size = 14), 
+        legend.position = "none", 
+        strip.background.x = element_blank(), 
+        strip.text = element_text(face = "bold", size = 14)) + 
+  scale_fill_viridis_d() + 
+  labs(x = NULL, y = "Mean GEBVs")
+```
+

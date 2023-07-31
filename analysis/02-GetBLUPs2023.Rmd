@@ -1,0 +1,169 @@
+---
+title: "Get BLUPs combining all trial data"
+author: "LucianoRogerio and Jean-Luc Jannink"
+date: "2023-07-27"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+## The big idea.  
+Should be able to start from on the work server and run this rmarkdown using  
+module load R/4.2.1-r9
+Rscript -e 'Sys.setenv(RSTUDIO_PANDOC="/usr/lib/rstudio-server/bin/quarto/bin/tools"); rmarkdown::render("/home/jj332/NRCRI_2023GS/analysis/02-GetBlups2023.Rmd")'  
+
+## Setup.  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = F,
+  tidy.opts=list(strict=FALSE,width.cutoff=100), highlight=TRUE)
+rm(list=ls())
+library(tidyverse); library(magrittr); library(genomicMateSelectR)
+
+netID <- "jj332"
+jobName <- "NRCRI_2023GS"
+outputFileNames <- readRDS(paste0("~/", jobName, "/output/OutputFileNames.rds"))
+```
+
+### Copy data.  
+Copy output from `01-cleanTPdata2023.Rmd` to the `data` folder.  
+Start with your scripts in a `workflow`-like directory structure with 
+`analysis`, `code`, `data`, and `output` subfolders in 
+`/home/netID/jobName`
+```{r copy files over}
+copyToDir <- paste0("/workdir/", netID, "/")
+homeJob <- paste0("/home/", netID, "/", jobName, "/")
+homeJobOut <- paste0(homeJob, "output/")
+
+dir.create(copyToDir)
+# Important to set overwrite=T in case you have to rerun the analysis with new files
+file.copy(from=homeJob, to=copyToDir, recursive=T, overwrite=T)
+
+# Now set the here::here base on the working server
+setwd(paste0(copyToDir, jobName, "/analysis/"))
+here::i_am("analysis/02-GetBlups2023.Rmd")
+```
+## Previous step
+
+1. [Prepare training dataset](PhenoData.html): Download data from DB, “Clean” and format DB data.
+
+## Get multi-trial BLUPs from raw data (two-stage)
+Two-stage procedure:
+
+1. Fit mixed-model to multi-trial dataset and extract BLUPs, de-regressed BLUPs and weights. Include two rounds of outlier removal.
+2. Genomic prediction with drg-BLUPs from multi-trial analysis as input.
+**Work below represents Stage 1 of the Two-stage procedure.**
+
+# Set-up training datasets
+
+```{r Set system threads}
+# activate multithread OpenBLAS for fast matrix algebra
+system("export OMP_NUM_THREADS=56")
+```
+
+## Detect experimental designs
+
+The next step is to check the experimental design of each trial. If you are absolutely certain of the usage of the design variables in your dataset, you might not need this step.
+
+Examples of reasons to do the step below:
+
+-   Some trials appear to be complete blocked designs and the blockNumber is used instead of replicate, which is what most use.
+-   Some complete block designs have nested, incomplete sub-blocks, others simply copy the "replicate" variable into the "blockNumber variable"
+-   Some trials have only incomplete blocks *but* the incomplete block info might be in the replicate *and/or* the blockNumber column
+
+One reason it might be important to get this right is that the variance among complete blocks might not be the same among incomplete blocks. If we treat a mixture of complete and incomplete blocks as part of the same random-effect (replicated-within-trial), we assume they have the same variance.
+
+Also error variances might be heterogeneous among different trial-types (blocking scheme available) *and/or* plot sizes (maxNOHAV).
+
+```{r Detect exptl designs}
+dbdata <- readRDS(here::here("output","NRCRI_CleanedTrialData_2023Jul26.rds"))
+dbdata <- mutate(dbdata, GID=germplasmName)
+dbdata <- detectExptDesigns(dbdata)
+
+dbdata %>% 
+    count(programName,CompleteBlocks,IncompleteBlocks) %>% rmarkdown::paged_table()
+```
+
+## Output file
+
+```{r Save the magnum opus}
+fileName <- "NRCRI_ExptDesignsDetected_2023July26.rds"
+saveRDS(dbdata, file=here::here("output", fileName))
+outputFileNames <- c(outputFileNames, exptDesigns=fileName)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileName, "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+```
+
+## Nest by trait
+Need to restructure the data from per-trial by regrouping by trait.  
+```{r Set up dbdata by design}
+# Need to get the file name from the end of `01-cleanTPdata2023.Rmd`
+traits <- c("CGM", "CGMS1", "CGMS2", "MCMDS",
+          "DMC", "DMCsg", "DRY",
+          "IVig1-7", "PLTHT", "BRNHT1", "StC", "HI",
+          "logDRYsgLD", "logFYLD", "logTOPYLD")
+# Took out "logDRYLD" for now
+dbdata <- nestDesignsDetectedByTraits(dbdata, traits)
+```
+
+To fit the mixed-model I used last year, I am again resorting to asreml. I fit random effects for rep and block only where complete and incomplete blocks, respectively are indicated in the trial design variables. sommer should be able to fit the same model via the at() function, but I am having trouble with it and sommer is much slower even without a dense covariance (i.e. a kinship), compared to `lme4::lmer()` or `asreml()`.
+
+```{r Setup formulas in dbdata}
+dbdata %<>% 
+  mutate(fixedFormula=ifelse(Trait %in% c("logDYLD","logFYLD","logRTNO","logTOPYLD"),
+                             "Value ~ yearInLoc + PropNOHAV","Value ~ yearInLoc"),
+         randFormula=paste0("~idv(GID) + idv(trialInLocYr) + at(CompleteBlocks,'Yes'):repInTrial ",
+                            "+ at(IncompleteBlocks,'Yes'):blockInRep"))
+
+dummy <- dbdata %>% 
+  mutate(Nobs=map_dbl(MultiTrialTraitData,nrow)) %>% 
+  select(Trait,Nobs,fixedFormula,randFormula) %>% 
+  rmarkdown::paged_table()
+```
+
+## Function to run asreml
+
+Includes rounds of outlier removal and re-fitting.
+
+```{r Asreml prediction, eval = F}
+library(furrr); options(mc.cores=8); plan(multisession)
+library(asreml)
+source(here::here("code", "get_blups_asreml.r"))
+
+runFAF <- function(i){
+  print(paste("#########################", dbdata$Trait[[i]]))
+  MultiTrialTraitData<-dbdata$MultiTrialTraitData[[i]]
+  fixedFormula<-dbdata$fixedFormula[[i]]
+  randFormula<-dbdata$randFormula[[i]]
+  return(fitAS=fitASfunc(fixedFormula,randFormula,MultiTrialTraitData))
+}
+fitA <- lapply(1:nrow(dbdata), runFAF)
+
+dbdata <- dbdata %>% 
+  mutate(fitAS=fitA)
+#dbdata <- dbdata %>% 
+#  mutate(fitAS=future_pmap(.,fitASfunc))
+dbdata %<>%
+  select(-fixedFormula,-randFormula,-MultiTrialTraitData) %>%
+  unnest(fitAS)
+```
+
+## Output File
+
+```{r Save BLUP outputs}
+fileName <- "NRCRI_blupsForModelTraining_twostage_asreml_2023Jul27.rds"
+saveRDS(dbdata, file=here::here("output", fileName))
+outputFileNames <- c(outputFileNames, blupsForTraining=fileName)
+saveRDS(outputFileNames, file=here::here("output", "OutputFileNames.rds"))
+
+filesToMoveHome <- c(fileName, "OutputFileNames.rds")
+file.copy(from=paste0(here::here("output/"), filesToMoveHome),
+          to=homeJobOut,
+          overwrite=T)
+```
+
+## Next step
+3. Check prediction accuracy: Evaluate prediction accuracy with cross-validation.
